@@ -26,6 +26,7 @@ import Process
 import Set
 import Task
 import Warrior exposing (Warrior)
+import Warrior.Coordinate exposing (Coordinate)
 import Warrior.Direction as Direction
 import Warrior.Internal.History as History exposing (History)
 import Warrior.Internal.Map as Map exposing (Map)
@@ -62,7 +63,7 @@ program : Config -> Program () Model Msg
 program config =
     Browser.element
         { init = always <| init config
-        , update = update
+        , update = update config
         , view = view
         , subscriptions = always Sub.none
         }
@@ -76,8 +77,8 @@ init config =
             , Cmd.none
             )
 
-        first :: rest ->
-            ( modelWithMap first rest config.players config.progressionFunction config.msPerTurn
+        first :: _ ->
+            ( modelWithMap 0 first config.players config.msPerTurn
             , msgAfter 0 BeginRound
             )
 
@@ -96,17 +97,24 @@ type Model
 type alias OngoingModel =
     { warriors : List PlayerDescription
     , currentMap : Map
-    , remainingMaps : List Template
+    , mapIndex : Int
+
+    --, remainingMaps : List Template
     , mapHistory : History
     , actionLog : List ( String, String )
-    , progressionFunction : ProgressionFunction
+
+    --, progressionFunction : ProgressionFunction
     , updateInterval : Float
     }
 
 
+getTemplate : Config -> Int -> Maybe Template
+getTemplate config mapIndex =
+    config.maps |> List.drop mapIndex |> List.head
+
+
 type alias PlayerDescription =
     { state : Warrior
-    , turnFunction : TurnFunction
     , color : Color
     }
 
@@ -119,27 +127,46 @@ type Msg
     | TakeTurn String
 
 
-update : Msg -> Model -> ( Model, Cmd Msg )
-update msg model =
+update : Config -> Msg -> Model -> ( Model, Cmd Msg )
+update config msg model =
     case model of
         Done _ ->
             ( model, Cmd.none )
 
         Ongoing ongoingModel ->
-            ongoingUpdate msg ongoingModel
+            ongoingUpdate config msg ongoingModel
 
 
-ongoingUpdate : Msg -> OngoingModel -> ( Model, Cmd Msg )
-ongoingUpdate msg model =
+getPlayersWithFunctions : Template -> Config -> List String -> List ( String, TurnFunction )
+getPlayersWithFunctions template config players =
+    let
+        npcAndPlayerDict =
+            MapTemplate.npcs template
+                |> List.map (\( warrior, turnFunction ) -> ( Player.id warrior, turnFunction ))
+                |> (++) config.players
+                |> Dict.fromList
+    in
+    List.map
+        (\player ->
+            ( player
+            , Dict.get player npcAndPlayerDict
+                |> Maybe.withDefault (\_ _ _ -> Warrior.Wait)
+            )
+        )
+        players
+
+
+ongoingUpdate : Config -> Msg -> OngoingModel -> ( Model, Cmd Msg )
+ongoingUpdate config msg model =
     case msg of
         InitializeMap progression ->
-            case ( progression, model.remainingMaps ) of
-                ( Progression.Advance players, [] ) ->
+            case ( progression, getTemplate config (model.mapIndex + 1) ) of
+                ( Progression.Advance players, Nothing ) ->
                     ( Done (Just players)
                     , Cmd.none
                     )
 
-                ( Progression.Advance players, next :: rest ) ->
+                ( Progression.Advance players, Just template ) ->
                     let
                         advancingPlayerIds =
                             List.map Player.id players
@@ -148,9 +175,9 @@ ongoingUpdate msg model =
                         advancingPlayers =
                             model.warriors
                                 |> List.filter (\pc -> Set.member (Player.id pc.state) advancingPlayerIds)
-                                |> List.map (\pc -> ( Player.id pc.state, pc.turnFunction ))
+                                |> List.map (\pc -> Player.id pc.state)
                     in
-                    ( modelWithMap next rest advancingPlayers model.progressionFunction model.updateInterval
+                    ( modelWithMap model.mapIndex template (getPlayersWithFunctions template config advancingPlayers) model.updateInterval
                     , msgAfter 0 BeginRound
                     )
 
@@ -186,7 +213,7 @@ ongoingUpdate msg model =
                 Just player ->
                     let
                         updatedModel =
-                            playerTurn player model
+                            playerTurn config player model
 
                         players =
                             updatedModel.warriors
@@ -194,7 +221,7 @@ ongoingUpdate msg model =
                                 |> List.filter Player.isHero
                     in
                     ( Ongoing updatedModel
-                    , case updatedModel.progressionFunction players updatedModel.currentMap updatedModel.mapHistory of
+                    , case config.progressionFunction players updatedModel.currentMap updatedModel.mapHistory of
                         Progression.Undecided ->
                             model.warriors
                                 |> List.dropWhile (\pc -> Player.id pc.state /= playerId)
@@ -209,34 +236,35 @@ ongoingUpdate msg model =
 
 
 modelWithMap :
-    Template
-    -> List Template
+    Int
+    -> Template
     -> List ( String, TurnFunction )
-    -> ProgressionFunction
     -> Float
     -> Model
-modelWithMap currentMap remainingMaps players progressionFunction updateInterval =
+modelWithMap mapIndex currentMap players updateInterval =
     let
+        pcs : List PlayerDescription
         pcs =
             MapTemplate.spawnPoints currentMap
                 |> List.map2 toPlayerDescription players
 
-        toPlayerDescription ( id, turnFunc ) cord =
+        toPlayerDescription : ( String, TurnFunction ) -> Coordinate -> PlayerDescription
+        toPlayerDescription ( id, _ ) cord =
             { state = Player.spawnHero id cord
-            , turnFunction = turnFunc
             , color = Color.fromRGB ( 0, 0, 0 )
             }
 
+        npcs : List PlayerDescription
         npcs =
             MapTemplate.npcs currentMap
                 |> List.map
-                    (\( state, turnFunc ) ->
+                    (\( state, _ ) ->
                         { state = state
-                        , turnFunction = turnFunc
                         , color = Color.fromRGB ( 0, 0, 0 )
                         }
                     )
 
+        playerDescriptions : List PlayerDescription
         playerDescriptions =
             List.append pcs npcs
                 |> List.map2 (\clr pd -> { pd | color = clr }) playerColors
@@ -275,10 +303,9 @@ modelWithMap currentMap remainingMaps players progressionFunction updateInterval
     Ongoing
         { warriors = playersWithUniqueIds
         , currentMap = MapTemplate.build currentMap
-        , remainingMaps = remainingMaps
+        , mapIndex = mapIndex
         , mapHistory = History.init
         , actionLog = []
-        , progressionFunction = progressionFunction
         , updateInterval = updateInterval
         }
 
@@ -289,14 +316,21 @@ msgAfter updateInterval msg =
         |> Task.perform (always msg)
 
 
-playerTurn : PlayerDescription -> OngoingModel -> OngoingModel
-playerTurn playerDescription model =
+playerTurn : Config -> PlayerDescription -> OngoingModel -> OngoingModel
+playerTurn config playerDescription model =
     let
+        playerDict =
+            Dict.fromList config.players
+
         updatedMap =
             Map.setNpcs (List.map .state model.warriors) model.currentMap
 
+        turnFunction =
+            Dict.get (Player.id playerDescription.state) playerDict
+                |> Maybe.withDefault (\_ _ _ -> Warrior.Wait)
+
         playerAction =
-            playerDescription.turnFunction playerDescription.state updatedMap model.mapHistory
+            turnFunction playerDescription.state updatedMap model.mapHistory
 
         updatePlayer fn event =
             { model
